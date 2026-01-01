@@ -1,13 +1,10 @@
 "use client";
 
 import Image from "next/image";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
-
+import { useConversation } from "@elevenlabs/react";
 import { cn } from "@/lib/utils";
-import { vapi } from "@/lib/vapi.sdk";
-import { interviewer } from "@/constants";
-import { createFeedback } from "@/lib/actions/general.action";
 
 enum CallStatus {
   INACTIVE = "INACTIVE",
@@ -17,8 +14,20 @@ enum CallStatus {
 }
 
 interface SavedMessage {
-  role: "user" | "system" | "assistant";
+  role: "user" | "assistant";
   content: string;
+}
+
+interface AgentProps {
+  userName: string;
+  userId: string;
+  interviewId?: string;
+  feedbackId?: string;
+  type: "generate" | "interview";
+  questions?: string[];
+  role?: string;
+  level?: string;
+  techstack?: string;
 }
 
 const Agent = ({
@@ -28,132 +37,176 @@ const Agent = ({
   feedbackId,
   type,
   questions,
+  role,
+  level,
+  techstack,
 }: AgentProps) => {
   const router = useRouter();
   const [callStatus, setCallStatus] = useState<CallStatus>(CallStatus.INACTIVE);
   const [messages, setMessages] = useState<SavedMessage[]>([]);
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [lastMessage, setLastMessage] = useState<string>("");
+  const [lastTranscript, setLastTranscript] = useState<string>("");
 
-  useEffect(() => {
-    const onCallStart = () => {
+  // Build the system prompt based on type
+  const getSystemPrompt = () => {
+    if (type === "generate") {
+      return `You are a professional job interview assistant. Your task is to conduct a mock interview for the following position:
+      
+Role: ${role}
+Experience Level: ${level}
+Tech Stack: ${techstack}
+
+Here are the interview questions to ask:
+${questions?.map((q, i) => `${i + 1}. ${q}`).join("\n")}
+
+Instructions:
+1. Start by greeting the candidate (${userName}) warmly and introducing yourself
+2. Ask each question one at a time
+3. Listen to their response and provide brief acknowledgment
+4. After all questions, thank them and let them know the interview is complete
+5. Keep the conversation professional but friendly
+6. Do not provide feedback during the interview, just acknowledge their answers
+
+Begin when the candidate is ready.`;
+    }
+    
+    return `You are a helpful AI assistant conducting a conversation with ${userName}.`;
+  };
+
+  // ElevenLabs Conversation hook
+  const conversation = useConversation({
+    onConnect: () => {
+      console.log("ElevenLabs connected");
       setCallStatus(CallStatus.ACTIVE);
-    };
-
-    const onCallEnd = () => {
+    },
+    onDisconnect: () => {
+      console.log("ElevenLabs disconnected");
       setCallStatus(CallStatus.FINISHED);
-    };
-
-    const onMessage = (message: Message) => {
-      if (message.type === "transcript" && message.transcriptType === "final") {
-        const newMessage = { role: message.role, content: message.transcript };
-        setMessages((prev) => [...prev, newMessage]);
+    },
+    onMessage: (message) => {
+      console.log("Message received:", message);
+      
+      // Handle different message types from ElevenLabs
+      if (message.type === "transcript" && message.transcript) {
+        // User transcript
+        if (message.role === "user") {
+          setMessages((prev) => [
+            ...prev,
+            { role: "user", content: message.transcript },
+          ]);
+        }
       }
-    };
+      
+      if (message.type === "agent_response") {
+        // Agent response
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: message.text || "" },
+        ]);
+      }
+    },
+    onError: (error) => {
+      console.error("ElevenLabs error:", error);
+      setCallStatus(CallStatus.INACTIVE);
+    },
+  });
 
-    const onSpeechStart = () => {
-      console.log("speech start");
-      setIsSpeaking(true);
-    };
+  // Track speaking state
+  useEffect(() => {
+    setIsSpeaking(conversation.isSpeaking);
+  }, [conversation.isSpeaking]);
 
-    const onSpeechEnd = () => {
-      console.log("speech end");
-      setIsSpeaking(false);
-    };
+  // Start the conversation
+  const handleStart = async () => {
+    try {
+      setCallStatus(CallStatus.CONNECTING);
 
-    const onError = (error: Error) => {
-      console.log("Error:", error);
-    };
+      // Get signed URL from your API
+      const response = await fetch("/api/elevenlabs/signed-url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          systemPrompt: getSystemPrompt(),
+          firstMessage: type === "generate" 
+            ? `Hello ${userName}! I'm your AI interviewer today. I'll be conducting a mock interview for the ${role} position. Are you ready to begin?`
+            : `Hello ${userName}! How can I help you today?`,
+        }),
+      });
 
-    vapi.on("call-start", onCallStart);
-    vapi.on("call-end", onCallEnd);
-    vapi.on("message", onMessage);
-    vapi.on("speech-start", onSpeechStart);
-    vapi.on("speech-end", onSpeechEnd);
-    vapi.on("error", onError);
+      if (!response.ok) {
+        throw new Error("Failed to get signed URL");
+      }
 
+      const { signedUrl } = await response.json();
+
+      // Start the conversation with the signed URL
+      await conversation.startSession({
+        signedUrl,
+      });
+    } catch (error) {
+      console.error("Failed to start conversation:", error);
+      setCallStatus(CallStatus.INACTIVE);
+    }
+  };
+
+  // End the conversation
+  const handleEnd = async () => {
+    try {
+      await conversation.endSession();
+      setCallStatus(CallStatus.FINISHED);
+
+      // Save the interview transcript if this is an interview
+      if (type === "generate" && interviewId && messages.length > 0) {
+        await saveTranscript();
+      }
+    } catch (error) {
+      console.error("Failed to end conversation:", error);
+    }
+  };
+
+  // Save transcript to your backend
+  const saveTranscript = async () => {
+    try {
+      const response = await fetch("/api/interviews/save-transcript", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          interviewId,
+          userId,
+          messages,
+          role,
+          level,
+          techstack,
+        }),
+      });
+
+      if (response.ok) {
+        // Navigate to feedback page
+        router.push(`/interview/${interviewId}/feedback`);
+      }
+    } catch (error) {
+      console.error("Failed to save transcript:", error);
+    }
+  };
+
+  // Cleanup on unmount
+  useEffect(() => {
     return () => {
-      vapi.off("call-start", onCallStart);
-      vapi.off("call-end", onCallEnd);
-      vapi.off("message", onMessage);
-      vapi.off("speech-start", onSpeechStart);
-      vapi.off("speech-end", onSpeechEnd);
-      vapi.off("error", onError);
+      if (conversation.status === "connected") {
+        conversation.endSession();
+      }
     };
   }, []);
-
-  useEffect(() => {
-    if (messages.length > 0) {
-      setLastMessage(messages[messages.length - 1].content);
-    }
-
-    const handleGenerateFeedback = async (messages: SavedMessage[]) => {
-      console.log("handleGenerateFeedback");
-
-      const { success, feedbackId: id } = await createFeedback({
-        interviewId: interviewId!,
-        userId: userId!,
-        transcript: messages,
-        feedbackId,
-      });
-
-      if (success && id) {
-        router.push(`/interview/${interviewId}/feedback`);
-      } else {
-        console.log("Error saving feedback");
-        router.push("/");
-      }
-    };
-
-    if (callStatus === CallStatus.FINISHED) {
-      if (type === "generate") {
-        router.push("/");
-      } else {
-        handleGenerateFeedback(messages);
-      }
-    }
-  }, [messages, callStatus, feedbackId, interviewId, router, type, userId]);
-
-  const handleCall = async () => {
-    setCallStatus(CallStatus.CONNECTING);
-
-    if (type === "generate") {
-      await vapi.start(process.env.NEXT_PUBLIC_VAPI_WORKFLOW_ID!, {
-        variableValues: {
-          username: userName,
-          userid: userId,
-        },
-      });
-    } else {
-      let formattedQuestions = "";
-      if (questions) {
-        formattedQuestions = questions
-          .map((question) => `- ${question}`)
-          .join("\n");
-      }
-
-      await vapi.start(interviewer, {
-        variableValues: {
-          questions: formattedQuestions,
-        },
-      });
-    }
-  };
-
-  const handleDisconnect = () => {
-    setCallStatus(CallStatus.FINISHED);
-    vapi.stop();
-  };
 
   return (
     <>
       <div className="call-view">
-        {/* AI Interviewer Card */}
+        {/* AI Avatar */}
         <div className="card-interviewer">
           <div className="avatar">
             <Image
               src="/ai-avatar.png"
-              alt="profile-image"
+              alt="AI Interviewer"
               width={65}
               height={54}
               className="object-cover"
@@ -163,14 +216,14 @@ const Agent = ({
           <h3>AI Interviewer</h3>
         </div>
 
-        {/* User Profile Card */}
+        {/* User Avatar */}
         <div className="card-border">
           <div className="card-content">
             <Image
               src="/user-avatar.png"
-              alt="profile-image"
-              width={539}
-              height={539}
+              alt="User"
+              width={540}
+              height={540}
               className="rounded-full object-cover size-[120px]"
             />
             <h3>{userName}</h3>
@@ -178,41 +231,45 @@ const Agent = ({
         </div>
       </div>
 
+      {/* Transcript Display */}
       {messages.length > 0 && (
         <div className="transcript-border">
           <div className="transcript">
             <p
-              key={lastMessage}
               className={cn(
                 "transition-opacity duration-500 opacity-0",
                 "animate-fadeIn opacity-100"
               )}
             >
-              {lastMessage}
+              {messages[messages.length - 1]?.content}
             </p>
           </div>
         </div>
       )}
 
+      {/* Call Controls */}
       <div className="w-full flex justify-center">
-        {callStatus !== "ACTIVE" ? (
-          <button className="relative btn-call" onClick={() => handleCall()}>
+        {callStatus !== CallStatus.ACTIVE ? (
+          <button
+            className="relative btn-call"
+            onClick={handleStart}
+            disabled={callStatus === CallStatus.CONNECTING}
+          >
             <span
               className={cn(
                 "absolute animate-ping rounded-full opacity-75",
-                callStatus !== "CONNECTING" && "hidden"
+                callStatus === CallStatus.CONNECTING && "hidden"
               )}
             />
-
             <span className="relative">
-              {callStatus === "INACTIVE" || callStatus === "FINISHED"
-                ? "Call"
-                : ". . ."}
+              {callStatus === CallStatus.INACTIVE || callStatus === CallStatus.FINISHED
+                ? "Start Interview"
+                : "Connecting..."}
             </span>
           </button>
         ) : (
-          <button className="btn-disconnect" onClick={() => handleDisconnect()}>
-            End
+          <button className="btn-disconnect" onClick={handleEnd}>
+            End Interview
           </button>
         )}
       </div>
